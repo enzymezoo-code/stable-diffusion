@@ -171,7 +171,10 @@ def load_mask(path, shape):
     # path (str): Path to the mask image
     # shape (list-like len(4)): shape of the image to match, usually latent_image.shape
     mask_w_h = (shape[-1], shape[-2])
-    mask_image = Image.open(path).convert("RGBA")
+    if path.startswith('http://') or path.startswith('https://'):
+        mask_image = Image.open(requests.get(path, stream=True).raw).convert('RGBA')
+    else:
+        mask_image = Image.open(path).convert('RGBA')
     mask = mask_image.resize(mask_w_h, resample=Image.LANCZOS)
     mask = mask.convert("L")
     
@@ -189,6 +192,7 @@ def maintain_colors(prev_img, color_match_sample, hsv=False):
         return cv2.cvtColor(matched_hsv, cv2.COLOR_HSV2RGB)
     else:
         return match_histograms(prev_img, color_match_sample, multichannel=True)
+
 
 
 def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, mask=None, init_latent=None, sigmas=None, sampler=None, masked_noise_modifier=1.0):  
@@ -216,17 +220,16 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
 
     # Function that is called on the image (img) and step (i) at each step
     def img_callback_(img, i):
-        i_inv = len(ddim_timesteps) - i - 1
-        ddim_timestep = ddim_timesteps[i_inv]
-        sqrt_alpha_cumprod = sqrt_alphas_cumprod[ddim_timestep]
-        sqrt_one_minus_alpha_cumprod = sqrt_one_minus_alphas_cumprod[ddim_timestep]
         # Thresholding functions
         if dynamic_threshold is not None:
             dynamic_thresholding_(img, dynamic_threshold)
         if static_threshold is not None:
             torch.clamp_(img, -1*static_threshold, static_threshold)
         if mask is not None:
-            init_noise = sqrt_alpha_cumprod * init_latent + sqrt_one_minus_alpha_cumprod * noise
+            if i > len(sigmas)-1:
+                init_noise = noise
+            else:
+                init_noise = sampler.stochastic_encode(init_latent, torch.tensor([i]*batch_size).to(device), noise=noise)
             is_masked = mask > sigmas[i]/sigmas[0]
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
@@ -235,11 +238,9 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
         noise = torch.randn_like(init_latent, device=device) * masked_noise_modifier
     if sampler_name in ["plms","ddim"]: 
         # Callback function formated for compvis latent diffusion samplers
-        assert sampler is not None, "Callback function for stable-diffusion samplers requires sampler variable"
-        
-        ddim_timesteps = sampler.ddim_timesteps
-        sqrt_alphas_cumprod = sampler.sqrt_alphas_cumprod
-        sqrt_one_minus_alphas_cumprod = sampler.sqrt_one_minus_alphas_cumprod
+        if mask is not None:
+            assert sampler is not None, "Callback function for stable-diffusion samplers requires sampler variable"
+            batch_size = init_latent.shape[0]
 
         callback = img_callback_
     else: 
@@ -273,27 +274,27 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
         init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
         init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space        
 
+    if not args.use_init and args.strength > 0:
+        print("No init image, but strength > 0. This may give you some strange results.")
+
     mask = None
     if args.use_mask:
-        assert args.mask_file is not None
-        assert args.use_init
-        assert init_latent is not None
+        assert args.mask_file is not None, "use_mask==True: An mask image is required for a mask"
+        assert args.use_init, "use_mask==True: use_init is required for a mask"
+        assert init_latent is not None, "use_mask==True: An latent init image is required for a mask"
         mask = load_mask(args.mask_file, init_latent.shape)
+        if args.invert_mask:
+            mask = ( (mask - 0.5) * -1) + 0.5
         mask = mask.to(device)
         mask = repeat(mask, '1 ... -> b ...', b=batch_size)
         
     t_enc = int((1.0-args.strength) * args.steps)
 
+    sigmas = model_wrap.get_sigmas(args.steps)
     if args.sampler in ['plms','ddim']:
         sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, verbose=False)
-        sigmas = torch.flip(sampler.ddim_sigmas,(0,))
-    else:
-        sigmas = model_wrap.get_sigmas(args.steps)
-        sigmas = sigmas[len(sigmas)-t_enc+1:]
+    sigmas = sigmas[len(sigmas)-t_enc:]
 
-    start_code = None
-    if args.fixed_code and init_latent == None:
-        start_code = torch.randn([args.n_samples, args.C, args.H // args.f, args.W // args.f], device=device)
 
     callback = make_callback(sampler_name=args.sampler,
                             dynamic_threshold=args.dynamic_threshold, 
@@ -322,6 +323,8 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
 
                         if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
                             shape = [args.C, args.H // args.f, args.W // args.f]
+                            if len(sigmas) == 0:
+                                sigmas = torch.zeros(1, device=device)
                             if args.use_init:
                                 x = init_latent + torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
                             else:
@@ -341,24 +344,17 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                             elif args.sampler=="euler_ancestral":
                                 samples = sampling.sample_euler_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
                         else:
-
-                            if init_latent is None and mask is None:
+                            # args.sampler == 'plms' or args.sampler == 'ddim':
+                            if init_latent is not None and args.strength > 0:
                                 z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
-                                samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=args.scale,
-                                                        unconditional_conditioning=uc,)
                             else:
-                                if args.sampler == 'plms' or args.sampler == 'ddim':
-                                    shape = [args.C, args.H // args.f, args.W // args.f]
-                                    samples, _ = sampler.sample(S=args.steps,
-                                                                    conditioning=c,
-                                                                    batch_size=args.n_samples,
-                                                                    shape=shape,
-                                                                    verbose=False,
-                                                                    unconditional_guidance_scale=args.scale,
-                                                                    unconditional_conditioning=uc,
-                                                                    eta=args.ddim_eta,
-                                                                    x_T=start_code,
-                                                                    img_callback=callback)
+                                z_enc = torch.randn([args.n_samples, args.C, args.H // args.f, args.W // args.f], device=device)
+                            samples = sampler.decode(z_enc, 
+                                                     c, 
+                                                     t_enc, 
+                                                     unconditional_guidance_scale=args.scale,
+                                                     unconditional_conditioning=uc,
+                                                     img_callback=callback)
 
                         if return_latent:
                             results.append(samples.clone())
@@ -670,8 +666,9 @@ def DeforumArgs():
     use_init = False #@param {type:"boolean"}
     strength = 0.5 #@param {type:"number"}
     init_image = "https://cdn.pixabay.com/photo/2022/07/30/13/10/green-longhorn-beetle-7353749_1280.jpg" #@param {type:"string"}
-    use_mask = True #@param {type:"boolean"}
+    use_mask = False #@param {type:"boolean"}
     mask_file = "" #@param {type:"string"}
+    invert_mask = False #@param {type:"boolean"}
 
     #@markdown **Sampling Settings**
     seed = -1 #@param
@@ -691,7 +688,6 @@ def DeforumArgs():
     grid_rows = 2 #@param 
 
     precision = 'autocast' 
-    fixed_code = True
     C = 4
     f = 8
 
