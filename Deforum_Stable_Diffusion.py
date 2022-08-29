@@ -214,7 +214,7 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
             dynamic_thresholding_(args_dict['x'], dynamic_threshold)
         if mask is not None:
             init_noise = init_latent + noise * args_dict['sigma']
-            is_masked = mask > args_dict['sigma']/sigmas[0]
+            is_masked = torch.logical_and(mask >= mask_schedule[args_dict['i']], mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + args_dict['x'] * torch.where(is_masked,0,1)
             args_dict['x'].copy_(new_img)
 
@@ -226,16 +226,19 @@ def make_callback(sampler_name, dynamic_threshold=None, static_threshold=None, m
         if static_threshold is not None:
             torch.clamp_(img, -1*static_threshold, static_threshold)
         if mask is not None:
-            if i > len(sigmas)-1:
-                init_noise = noise
-            else:
-                init_noise = sampler.stochastic_encode(init_latent, torch.tensor([i]*batch_size).to(device), noise=noise)
-            is_masked = mask > sigmas[i]/sigmas[0]
+            i_inv = len(sigmas) - i - 1
+            init_noise = sampler.stochastic_encode(init_latent, torch.tensor([i_inv]*batch_size).to(device), noise=noise)
+            is_masked = torch.logical_and(mask >= mask_schedule[i], mask != 0 )
             new_img = init_noise * torch.where(is_masked,1,0) + img * torch.where(is_masked,0,1)
             img.copy_(new_img)
+            
               
     if init_latent is not None:
         noise = torch.randn_like(init_latent, device=device) * masked_noise_modifier
+    if sigmas is not None and len(sigmas) > 0:
+        mask_schedule = torch.flip(sigmas/sigmas[0],[0])
+    elif len(sigmas) == 0:
+        mask = None # no mask needed if no steps (usually happens because strength==1.0)
     if sampler_name in ["plms","ddim"]: 
         # Callback function formated for compvis latent diffusion samplers
         if mask is not None:

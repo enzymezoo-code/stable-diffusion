@@ -241,6 +241,6 @@ class DDIMSampler(object):
                                           unconditional_guidance_scale=unconditional_guidance_scale,
                                           unconditional_conditioning=unconditional_conditioning)
 
-            if img_callback: img_callback(x_dec, index)
+            if img_callback: img_callback(x_dec, i)
 
         return x_dec
