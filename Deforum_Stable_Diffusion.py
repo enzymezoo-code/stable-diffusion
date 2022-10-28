@@ -532,8 +532,6 @@ def DeforumArgs():
     #@markdown **Other Conditional Settings**
     init_mse_scale = 0 #@param {type:"number"}
     init_mse_image = "https://cdn.pixabay.com/photo/2022/07/30/13/10/green-longhorn-beetle-7353749_1280.jpg" #@param {type:"string"}
-
-    blue_scale = 0 #@param {type:"number"}
     
     #@markdown **Conditional Gradient Settings**
     gradient_wrt = 'x0_pred' #@param ["x", "x0_pred"]

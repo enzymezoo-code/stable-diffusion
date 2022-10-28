@@ -19,6 +19,6 @@
     "decode_method": "autoencoder",
     "grad_threshold_type": "dynamic",
     "clamp_grad_threshold": 0.2,
-    "grad_inject_timing": [0.8,0.82,0.84,0.86,0.9,0.92,0.94,0.96,0.98,1.0],
+    "grad_inject_timing": [0.8,0.82,0.84,0.86,0.88,0.9,0.92,0.94,0.96,0.98,1.0],
     "cond_uncond_sync": true
 }
